@@ -316,6 +316,105 @@ Verified working.
 
 ---
 
+## Auto-start on boot (set-and-forget)
+
+Getting the server working once is one thing. Making it come back on its own
+after a reboot or a power blip took more work than I expected, because two things
+quietly break on resume. Here is the full picture for surviving a reboot
+unattended.
+
+### Finding 1 -- `--network-preferred-route` does NOT persist across a reboot
+
+This is the one that bites you. The flag works the first time you start Colima,
+but it is not durable. Every `colima start` (a resume of the existing VM)
+resurrects Lima's internal-NAT default route on `eth0` (the internal
+`192.168.x.x` interface) at a **lower metric** than the bridged `col0`. So the
+asymmetric routing I fought during the initial setup comes right back on every
+boot: inbound arrives on the bridged interface, outbound tries to leave via the
+internal NAT.
+
+The symptoms are the same two I saw before:
+
+- The client connect goes from working to **"timed out"**, or
+- The server logs **"Could not retrieve account login details"** -- its own
+  outbound to Speedify's cloud is broken by the bad route.
+
+The fix, applied **on every boot**: after `colima start`, delete the `eth0`
+default so the bridged interface is the sole default route, then bounce the
+server so it re-establishes its cloud connections over the correct path:
+
+```sh
+colima ssh -- sudo ip route del default dev eth0
+docker compose restart
+```
+
+The boot script below does both automatically.
+
+### Finding 2 -- vz fails to start under heavy early-boot load
+
+The first time I wired up auto-start, it failed. The cause: the LaunchAgent
+fired the instant the user session came up, while the box was still thrashing
+through login (load average around 29). The vz backend
+(Apple's Virtualization.framework) does not tolerate that -- the VM exited
+immediately on `colima start`.
+
+The fix is to be patient and to retry. The boot script waits for the LAN gateway
+to answer, sleeps about 45 seconds to let the early-boot load settle, and then
+retries `colima start` up to 6 times, stopping and pausing between attempts.
+
+### Finding 3 -- use a USER LaunchAgent + auto-login, NOT a root LaunchDaemon
+
+This is the non-obvious part. The natural instinct is a root `LaunchDaemon` so it
+runs at boot before anyone logs in. That does **not** work here: the vz backend
+needs a real user GUI session, which a root LaunchDaemon does not provide. A
+**LaunchAgent** runs inside the user's login session, which is what vz wants.
+
+That means the Mac has to actually log a user in on its own. Requirements:
+
+- **Auto-login enabled** (System Settings -> Users & Groups -> automatically log
+  in as your user) so a GUI session exists after a reboot.
+- **FileVault OFF.** With FileVault on, the disk is locked at boot until someone
+  types the password, so nothing auto-starts. It has to be off for unattended
+  boot.
+
+You do **not** need to give the LaunchAgent any sudo rights for the bridge.
+Colima already installs `/etc/sudoers.d/colima` for `socket_vmnet` the first time
+you start with bridged networking, so the bridged start is passwordless. The
+`ip route del` step runs inside the VM via `colima ssh -- sudo ...`, which is
+also fine without host sudo.
+
+### Finding 4 -- clamshell / headless
+
+If the Mac runs lid-closed (mine does), keep it awake with:
+
+```sh
+sudo pmset -a disablesleep 1
+```
+
+Confirm it took with `pmset -g | grep SleepDisabled` -- you want `SleepDisabled 1`.
+This keeps the lid-closed machine from sleeping and killing the tunnel.
+
+### Putting it together
+
+Two files in this repo wire all of the above:
+
+- `start.sh` -- the hardened boot script. It waits for the gateway, lets load
+  settle, retries `colima start`, removes the stale `eth0` default route, then
+  brings up and restarts the stack. It logs to `~/speedify-autostart/boot.log` so
+  you can see what happened on the last boot.
+- `com.user.speedify-selfhosted.plist` -- the LaunchAgent that runs `start.sh` at
+  login. Drop it in `~/Library/LaunchAgents/`, edit the paths for your user, and
+  load it:
+
+  ```sh
+  launchctl load ~/Library/LaunchAgents/com.user.speedify-selfhosted.plist
+  ```
+
+After that, with auto-login on and FileVault off, the server stands itself back
+up after a reboot with no hands on the keyboard.
+
+---
+
 ## Files in this repo
 
 | File                       | What it is |
@@ -326,3 +425,5 @@ Verified working.
 | `speedify-na-watch`        | Watcher loop: polls Speedify state, flips flow offloading to match. |
 | `speedify-na-watch.init`   | procd init script to run the watcher as a managed service. |
 | `flint3-port-forward.md`   | Edge-router port-forward rules (GL UI + UCI CLI) and DDNS notes. |
+| `start.sh`                 | Hardened boot script: waits for the gateway, retries `colima start`, removes the stale `eth0` default route, brings up the stack. |
+| `com.user.speedify-selfhosted.plist` | LaunchAgent that runs `start.sh` at login (pair with auto-login + FileVault off). |
