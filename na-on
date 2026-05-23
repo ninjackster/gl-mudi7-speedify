@@ -1,0 +1,16 @@
+#!/bin/sh
+#
+# na-on -- turn GL.iNet "Network Acceleration" back ON (flow offloading).
+#
+# On this Qualcomm Mudi 7, GL "Network Acceleration" maps to the OpenWrt
+# firewall flow_offloading flag (SFE / qcmap_sfe is not configured here). It
+# roughly doubles routed throughput on a gigabit line, so you want it ON during
+# normal use. The catch: it conflicts with Speedify's PEP, so it must be OFF
+# while Speedify is connected. The speedify-na-watch service flips this
+# automatically; this script is the manual ON path.
+
+uci set firewall.@defaults[0].flow_offloading='1'
+uci commit firewall
+/etc/init.d/firewall reload >/dev/null 2>&1
+logger -t speedify-na "Network Acceleration ON (flow_offloading=1)"
+echo "Network Acceleration ON"

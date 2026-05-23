@@ -1,0 +1,14 @@
+#!/bin/sh
+#
+# na-off -- turn GL.iNet "Network Acceleration" OFF (flow offloading).
+#
+# Speedify's PEP conflicts with flow offloading on this box: with it ON,
+# Speedify connects but no traffic passes (you get "connected, no internet").
+# Turn it OFF before/while Speedify is connected. The speedify-na-watch service
+# does this automatically; this script is the manual OFF path.
+
+uci set firewall.@defaults[0].flow_offloading='0'
+uci commit firewall
+/etc/init.d/firewall reload >/dev/null 2>&1
+logger -t speedify-na "Network Acceleration OFF (flow_offloading=0)"
+echo "Network Acceleration OFF"

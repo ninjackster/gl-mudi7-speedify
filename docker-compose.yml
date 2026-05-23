@@ -1,0 +1,48 @@
+# Speedify Self-Hosted Server (ss-manager)
+# Runs on an Intel Mac via Colima + Docker. The image is amd64, so it needs a
+# native x86_64 host (or an Intel Mac). Do NOT run it on Apple Silicon: the only
+# image is linux/amd64 and emulation kills a CPU-bound bonding/crypto workload.
+#
+# After the first `docker compose up -d`, watch the logs for the QR code +
+# activation URL, sign into your Speedify account, buy a Self-Hosted Personal
+# license, then bounce the stack (`docker compose down && docker compose up -d`)
+# to apply the license.
+
+services:
+  speed-server:
+    platform: linux/amd64
+    image: speedify/ss-manager:latest
+    volumes:
+      - ${DOCKER_SOCK_PATH:-/var/run/docker.sock}:/run/docker.sock
+      - ./.local/ssm/analytics:/var/log/speedify/analytics
+      - ./.local/ssm/var/log/speedify/servers:/var/log/speedify/servers
+      - ./.local/ssm/var/run/speedify/servers:/var/run/speedify/servers
+      - /proc:/host-proc:ro
+      - ./.local/ssm/var/lib/ssm:/var/lib/ssm
+    ports:
+      # API only: host 8443 -> container 443.
+      #
+      # IMPORTANT: publish ONLY the API port here. The per-connection child
+      # containers (speedify/simple-ss) publish their OWN session ports inside
+      # PUBLISHED_PORT_RANGE. If you pre-bind that whole range on this parent
+      # container you get "all ports are allocated" and connections fail.
+      - 8443:443
+    environment:
+      ALLOCATION_TYPE: ondemand
+      ENABLE_SESSION_TOKENS: "true"
+      DIRECTORY_URI: "https://directory.speedifynetworks.com"
+      SELF_HOSTED_MODE: "true"
+      PUBLIC_API_PORT: "8443"
+      API_HTTP_PORT: "80"
+      API_HTTPS_PORT: "443"
+      DOCKER_REPO_PREFIX: "speedify"
+      # Forwardable session-transport block (101 ports, TCP+UDP). The default is
+      # 32768-65535 (32k+ ports), far too large to forward through a home
+      # gateway. Shrink it to a small block and forward exactly that block (both
+      # TCP and UDP) on your edge router. The child containers bind their ports
+      # inside this range.
+      PUBLISHED_PORT_RANGE: "51000-51100"
+      # Behind NAT: set this to your edge router's WAN (public) IP so the server
+      # advertises a reachable address. Example: PUBLIC_IP: "203.0.113.42"
+      PUBLIC_IP: "<WAN_IP>"
+    restart: always

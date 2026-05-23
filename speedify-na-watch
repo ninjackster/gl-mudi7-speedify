@@ -1,0 +1,55 @@
+#!/bin/sh
+#
+# speedify-na-watch -- poll Speedify's connection state and toggle GL "Network
+# Acceleration" (OpenWrt flow_offloading) to match.
+#
+#   Speedify CONNECTED      -> flow_offloading OFF (PEP needs it off)
+#   Speedify NOT connected  -> flow_offloading ON  (keep gigabit routing fast)
+#
+# This is the body of the procd service defined in speedify-na-watch.init.
+# It loops forever and only writes/reloads the firewall when the desired state
+# actually changes, so it is cheap to run.
+
+CLI=/usr/share/speedify/speedify_cli
+POLL_SECONDS=10
+
+# Track what we last applied so we only reload the firewall on a real change.
+# Start "unknown" so the first matching state always gets applied.
+last=""
+
+get_offloading() {
+	uci -q get firewall.@defaults[0].flow_offloading
+}
+
+set_offloading() {
+	# $1 = 0 (off) or 1 (on)
+	cur="$(get_offloading)"
+	[ "$cur" = "$1" ] && return 0
+	uci set firewall.@defaults[0].flow_offloading="$1"
+	uci commit firewall
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	logger -t speedify-na "flow_offloading set to $1 (speedify state change)"
+}
+
+while true; do
+	# `speedify_cli state` prints the connection state, e.g. CONNECTED /
+	# CONNECTING / LOGGED_IN / DISCONNECTED. Treat CONNECTED as "tunnel up".
+	state="$($CLI state 2>/dev/null)"
+
+	case "$state" in
+		*CONNECTED*) desired="off" ;;
+		*)           desired="on"  ;;
+	esac
+
+	if [ "$desired" != "$last" ]; then
+		if [ "$desired" = "off" ]; then
+			set_offloading 0
+		else
+			set_offloading 1
+		fi
+		last="$desired"
+		logger -t speedify-na "speedify state=[$state] -> NA $desired"
+	fi
+
+	sleep "$POLL_SECONDS"
+done

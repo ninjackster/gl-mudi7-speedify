@@ -1,0 +1,37 @@
+#!/bin/sh /etc/rc.common
+#
+# speedify-na-watch.init -- procd init script for the Network Acceleration
+# watcher.
+#
+# Install on the Mudi 7 as /etc/init.d/speedify-na-watch (chmod +x), with the
+# watcher loop at /usr/bin/speedify-na-watch (also chmod +x). Then:
+#
+#   /etc/init.d/speedify-na-watch enable
+#   /etc/init.d/speedify-na-watch start
+#
+# procd keeps it alive and restarts it if it dies. Logs go to the system log
+# under the "speedify-na" tag (read with `logread | grep speedify-na`).
+
+START=99
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/speedify-na-watch
+
+start_service() {
+	procd_open_instance
+	procd_set_param command "$PROG"
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	# Best-effort: leave NA in the fast (ON) state when the watcher stops, so a
+	# disabled watcher doesn't leave routing crippled.
+	uci set firewall.@defaults[0].flow_offloading='1'
+	uci commit firewall
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	logger -t speedify-na "watcher stopped; flow_offloading restored to 1"
+}
