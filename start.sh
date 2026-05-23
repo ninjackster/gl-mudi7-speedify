@@ -10,6 +10,10 @@ for try in {1..6}; do
   colima stop >/dev/null 2>&1; sleep 25
 done
 sleep 5
-colima ssh -- sudo ip route del default dev eth0 2>/dev/null
+# Pin the bridged col0 default route. A bare boot-time delete of eth0's default
+# is not durable (it comes back on DHCP renewal), so route-fix.sh installs a
+# metric-50 col0 default that wins even after eth0 re-adds its own. The
+# com.user.speedify-routefix LaunchAgent then re-enforces this every 120s.
+"$HOME/speedify-autostart/route-fix.sh"
 cd "$HOME/speedify-selfhosted" && docker compose up -d && sleep 8 && docker compose restart
 colima ls

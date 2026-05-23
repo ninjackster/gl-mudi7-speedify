@@ -348,7 +348,11 @@ colima ssh -- sudo ip route del default dev eth0
 docker compose restart
 ```
 
-The boot script below does both automatically.
+The boot script below does both automatically. **But note:** deleting the `eth0`
+default at boot is necessary but **not sufficient on its own** -- the route comes
+back at runtime on the next DHCP lease renewal. See the "Critical: keep the VM's
+default route on the bridge" section below for the durable fix that survives
+renewals.
 
 ### Finding 2 -- vz fails to start under heavy early-boot load
 
@@ -399,9 +403,9 @@ This keeps the lid-closed machine from sleeping and killing the tunnel.
 Two files in this repo wire all of the above:
 
 - `start.sh` -- the hardened boot script. It waits for the gateway, lets load
-  settle, retries `colima start`, removes the stale `eth0` default route, then
-  brings up and restarts the stack. It logs to `~/speedify-autostart/boot.log` so
-  you can see what happened on the last boot.
+  settle, retries `colima start`, calls `route-fix.sh` to pin the bridged default
+  route, then brings up and restarts the stack. It logs to
+  `~/speedify-autostart/boot.log` so you can see what happened on the last boot.
 - `com.user.speedify-selfhosted.plist` -- the LaunchAgent that runs `start.sh` at
   login. Drop it in `~/Library/LaunchAgents/`, edit the paths for your user, and
   load it:
@@ -415,6 +419,102 @@ up after a reboot with no hands on the keyboard.
 
 ---
 
+## Critical: keep the VM's default route on the bridge (DHCP-renewal reversion)
+
+This is the failure that took me the longest to find, because it does not show up
+at boot. The tunnel comes up clean, runs fine for a day or two, and then **dies
+on its own with no reboot and no change on my end**. If you only do the boot-time
+`ip route del default dev eth0` from the auto-start section above, you will hit
+this. A one-shot fix at boot is **not** enough.
+
+### Root cause
+
+The Colima VM has two interfaces: `eth0` (Lima's internal user-NAT) and `col0`
+(the bridged LAN interface I added for self-hosting). The bridged `col0` gets its
+LAN address by DHCP from my router. When that **DHCP lease renews** (hours after
+boot, on the lease's own schedule), Lima's `eth0` re-adds its **own default
+route** at metric 200. That outranks the bridged `col0` default at metric 300, so
+the VM silently flips back to **asymmetric routing**: inbound packets still arrive
+on `col0` via the port-forward, but outbound now leaves via `eth0`'s NAT.
+
+That asymmetry is exactly what breaks Speedify's UDP session. The handshake on the
+TCP API still looks fine, but the UDP session traffic returns on the wrong path
+and the session quietly drops. From the outside it looks like the server "just
+stopped working days later" with nothing to point at. There is nothing in the
+logs at the moment it breaks, because nothing crashed: the route just moved.
+
+The boot-time `ip route del default dev eth0` does not survive this, because the
+re-add happens at runtime on the next lease renewal, long after the boot script
+has finished.
+
+### The durable fix (three layers)
+
+**1. Pin a low-metric `col0` default inside the VM.** Instead of just deleting the
+`eth0` default (which comes back), replace the `col0` default with a metric *lower*
+than whatever `eth0` re-adds:
+
+```sh
+colima ssh -- sudo ip route replace default via <ROUTER_LAN_IP> dev col0 metric 50
+```
+
+Metric 50 beats `eth0`'s metric 200, so even when `eth0` re-adds its default on a
+DHCP renewal, `col0` stays the winning default route. This alone eliminates the
+breakage. Verify the VM is actually choosing the bridge for outbound:
+
+```sh
+colima ssh -- ip route get 1.1.1.1   # should show dev col0, not eth0
+```
+
+**2. A periodic watchdog (macOS LaunchAgent).** Routes can still get flushed (a
+full lease drop, a network blip), so I enforce the rule on a timer rather than
+trusting it to hold forever. `route-fix.sh` re-applies the two route commands, and
+`com.user.speedify-routefix.plist` runs it every 120 seconds via `StartInterval`
+(plus `RunAtLoad`). It runs as a **user LaunchAgent**, so it needs **no macOS
+sudo**: the `sudo` inside the commands is passwordless *inside the Lima VM*, which
+is what `colima ssh -- sudo ...` invokes.
+
+The watchdog self-heals against renewals and flushes: within two minutes of any
+reversion, the metric-50 `col0` default is back and the session is fine.
+
+**Gotcha: do NOT pass a quoted compound command to `colima ssh`.** A single call
+like `colima ssh -- "ip route del default dev eth0; ip route replace ..."` does
+**not** work the way you would expect; the quoted compound breaks under
+`colima ssh`. Use **two separate `colima ssh --` calls**, one per command, which is
+exactly what `route-fix.sh` does:
+
+```sh
+colima ssh -- sudo ip route del default dev eth0 2>/dev/null
+colima ssh -- sudo ip route replace default via <ROUTER_LAN_IP> dev col0 metric 50 2>/dev/null
+```
+
+**3. Wire it into `start.sh`.** The boot script calls `route-fix.sh` right after
+`colima start`, so the correct route is in place the instant the VM is up, before
+the watchdog's first interval even fires.
+
+### Install the watchdog
+
+Drop `route-fix.sh` in `~/speedify-autostart/`, edit `<ROUTER_LAN_IP>` to your
+router's LAN gateway, make it executable, drop the plist in
+`~/Library/LaunchAgents/` with the paths edited for your user, then bootstrap it:
+
+```sh
+chmod +x ~/speedify-autostart/route-fix.sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.speedify-routefix.plist
+```
+
+Check it is running and watch it work:
+
+```sh
+launchctl print gui/$(id -u)/com.user.speedify-routefix | grep state
+tail -f ~/speedify-autostart/routefix.log
+```
+
+With the metric-50 route, the watchdog, and the `start.sh` wiring all in place,
+the "works at first, dies days later" failure is gone. The VM's default route
+stays on the bridge no matter how many times the DHCP lease renews.
+
+---
+
 ## Files in this repo
 
 | File                       | What it is |
@@ -425,5 +525,7 @@ up after a reboot with no hands on the keyboard.
 | `speedify-na-watch`        | Watcher loop: polls Speedify state, flips flow offloading to match. |
 | `speedify-na-watch.init`   | procd init script to run the watcher as a managed service. |
 | `flint3-port-forward.md`   | Edge-router port-forward rules (GL UI + UCI CLI) and DDNS notes. |
-| `start.sh`                 | Hardened boot script: waits for the gateway, retries `colima start`, removes the stale `eth0` default route, brings up the stack. |
+| `start.sh`                 | Hardened boot script: waits for the gateway, retries `colima start`, pins the bridged default route via `route-fix.sh`, brings up the stack. |
 | `com.user.speedify-selfhosted.plist` | LaunchAgent that runs `start.sh` at login (pair with auto-login + FileVault off). |
+| `route-fix.sh`             | Re-pins the metric-50 `col0` default route in the VM so a DHCP-renewal `eth0` re-add cannot break Speedify's UDP session. |
+| `com.user.speedify-routefix.plist` | LaunchAgent that runs `route-fix.sh` every 120s as a watchdog against route reversion. |
